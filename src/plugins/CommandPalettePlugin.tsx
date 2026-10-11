@@ -11,7 +11,6 @@ import {
     Chip,
     IconButton,
     InputAdornment,
-    Paper,
 } from '@mui/material';
 import SearchIcon from '@mui/icons-material/Search';
 import KeyboardCommandKeyIcon from '@mui/icons-material/KeyboardCommandKey';
@@ -19,7 +18,8 @@ import ArrowForwardIcon from '@mui/icons-material/ArrowForward';
 import { useIsMobile } from '../hooks/useMediaQuery';
 import ClearIcon from '@mui/icons-material/Clear';
 import { registerPlugin } from './registry';
-import { unregisterPluginShortcuts } from '../services/shortcuts/ShortcutRegistry';
+import { registerPluginSlot, unregisterPluginSlot } from './slotUtils';
+import { registerShortcut, unregisterPluginShortcuts } from '../services/shortcuts/ShortcutRegistry';
 
 const PLUGIN_ID = 'command-palette';
 
@@ -34,93 +34,212 @@ interface CommandItem {
     keywords: string[];
 }
 
+interface IndexedResource {
+    type: string;
+    kind: string;
+    name: string;
+    namespace: string;
+    nameLower: string;
+}
+
+interface ResourceKind {
+    type: string;
+    label: string;
+    keywords: string[];
+}
+
+// Keyed by the `.kind` kubectl reports; `type` is the resource list id the app navigates to.
+const RESOURCE_KINDS: Record<string, ResourceKind> = {
+    Pod: { type: 'pods', label: 'Pods', keywords: ['po', 'logs', 'exec', 'shell', 'container'] },
+    Deployment: { type: 'deployments', label: 'Deployments', keywords: ['deploy', 'workload'] },
+    StatefulSet: { type: 'statefulsets', label: 'StatefulSets', keywords: ['sts', 'workload'] },
+    DaemonSet: { type: 'daemonsets', label: 'DaemonSets', keywords: ['ds', 'workload'] },
+    Job: { type: 'jobs', label: 'Jobs', keywords: ['workload'] },
+    CronJob: { type: 'cronjobs', label: 'CronJobs', keywords: ['cj', 'schedule'] },
+    Service: { type: 'services', label: 'Services', keywords: ['svc', 'network'] },
+    Ingress: { type: 'ingresses', label: 'Ingresses', keywords: ['ing', 'network'] },
+    ConfigMap: { type: 'configmaps', label: 'ConfigMaps', keywords: ['cm', 'config'] },
+    Node: { type: 'nodes', label: 'Nodes', keywords: ['no', 'cluster'] },
+    Namespace: { type: 'namespaces', label: 'Namespaces', keywords: ['ns', 'cluster'] },
+};
+
+const NAVIGATION_TYPES: ResourceKind[] = [
+    ...Object.values(RESOURCE_KINDS),
+    { type: 'events', label: 'Events', keywords: ['ev', 'warnings'] },
+];
+
+const RESOURCE_TYPES_ARG = Object.values(RESOURCE_KINDS).map((kind) => kind.type).join(',');
+const RESOURCE_JSONPATH = '{range .items[*]}{.kind}{"\\t"}{.metadata.namespace}{"\\t"}{.metadata.name}{"\\n"}{end}';
+const RESOURCE_INDEX_TTL_MS = 60_000;
+const MAX_COMMAND_RESULTS = 5;
+const MAX_RESOURCE_RESULTS = 12;
+
+// Shared across palette mounts; rebuilt when it is stale or the kube context changed.
+let resourceIndex: { context: string; loadedAt: number; items: IndexedResource[] } | null = null;
+
+const navigateToResource = (type: string, name?: string, namespace?: string): void => {
+    window.dispatchEvent(new CustomEvent('globalSearchNavigate', {
+        detail: name ? { type, name, namespace: namespace || undefined } : { type },
+    }));
+};
+
+const loadResourceIndex = async (abortId: string): Promise<{ items: IndexedResource[]; error: string | null }> => {
+    const result = await window.kubectl.execArgs(
+        ['get', RESOURCE_TYPES_ARG, '--all-namespaces', '-o', `jsonpath=${RESOURCE_JSONPATH}`],
+        { abortId },
+    );
+    const items = result.stdout
+        .split('\n')
+        .map((line) => line.split('\t'))
+        .filter((parts) => parts.length === 3 && RESOURCE_KINDS[parts[0]] && parts[2])
+        .map(([kind, namespace, name]) => ({
+            type: RESOURCE_KINDS[kind].type,
+            kind,
+            namespace,
+            name,
+            nameLower: name.toLowerCase(),
+        }));
+    // A forbidden or missing type fails the call but kubectl still prints the types it could list.
+    const error = result.code !== 0 && items.length === 0 ? (result.stderr.trim() || 'Could not list cluster resources.') : null;
+    return { items, error };
+};
+
+const rankResource = (resource: IndexedResource, query: string): number => {
+    if (resource.nameLower === query) return 0;
+    if (resource.nameLower.startsWith(query)) return 1;
+    if (resource.nameLower.includes(query)) return 2;
+    if (`${resource.namespace}/${resource.nameLower}`.includes(query)) return 3;
+    return -1;
+};
+
 const CommandPalette: React.FC = () => {
     const isMobile = useIsMobile();
     const [open, setOpen] = useState(false);
     const [query, setQuery] = useState('');
     const [selectedIndex, setSelectedIndex] = useState(0);
+    const [resources, setResources] = useState<IndexedResource[]>(() => resourceIndex?.items ?? []);
+    const [loading, setLoading] = useState(false);
+    const [resourceError, setResourceError] = useState<string | null>(null);
     const inputRef = useRef<HTMLInputElement>(null);
-    // Mock data for resources
-    const resourceTypes = [{ id: 'pods', label: 'Pods', icon: 'Pods' }, { id: 'deployments', label: 'Deployments', icon: 'Deployments' }];
-    const resources: Record<string, any[]> = { pods: [], deployments: [] };
-    const loading = false;
-    const refresh = () => {};
 
-    // Build command list from resources and actions
-    const commands = useMemo<CommandItem[]>(() => {
-        const items: CommandItem[] = [];
+    const close = useCallback(() => setOpen(false), []);
 
-        // Add common actions
-        items.push(
-            {
-                id: 'action-logs',
-                title: 'View Pod Logs',
-                subtitle: 'Open logs for a specific pod',
-                category: 'action',
-                action: () => {
-                    window.location.hash = '#/pods';
-                    setOpen(false);
-                },
-                keywords: ['logs', 'pod', 'container', 'view'],
-            },
-            {
-                id: 'action-exec',
-                title: 'Execute in Pod',
-                subtitle: 'Open shell in a running container',
-                category: 'action',
-                action: () => {
-                    window.location.hash = '#/terminal';
-                    setOpen(false);
-                },
-                keywords: ['exec', 'shell', 'terminal', 'bash', 'sh'],
-            },
-            {
-                id: 'action-describe',
-                title: 'Describe Resource',
-                subtitle: 'Get detailed resource information',
-                category: 'action',
-                action: () => setOpen(false),
-                keywords: ['describe', 'get', 'details', 'yaml'],
-            },
-            {
-                id: 'nav-settings',
-                title: 'Settings',
-                subtitle: 'Open application settings',
-                category: 'navigation',
-                action: () => {
-                    window.location.hash = '#/settings';
-                    setOpen(false);
-                },
-                keywords: ['settings', 'preferences', 'config'],
-            },
-            {
-                id: 'nav-plugins',
-                title: 'Plugin Manager',
-                subtitle: 'Manage installed plugins',
-                category: 'navigation',
-                action: () => {
-                    window.location.hash = '#/plugins';
-                    setOpen(false);
-                },
-                keywords: ['plugins', 'extensions', 'marketplace'],
-            },
-        );
+    useEffect(() => {
+        if (!open) return;
+        let cancelled = false;
+        const abortId = `command-palette-${Date.now()}`;
+        void (async () => {
+            const context = await window.k8s?.getCurrentContext?.()
+                .then((result) => result.context ?? '', () => '') ?? '';
+            if (cancelled) return;
+            if (resourceIndex && resourceIndex.context === context && Date.now() - resourceIndex.loadedAt < RESOURCE_INDEX_TTL_MS) {
+                setResources(resourceIndex.items);
+                return;
+            }
+            if (resourceIndex?.context !== context) {
+                setResources([]);
+            }
+            if (!window.kubectl?.execArgs) {
+                setResourceError('Resource search needs the desktop app.');
+                return;
+            }
+            setLoading(true);
+            setResourceError(null);
+            try {
+                const { items, error } = await loadResourceIndex(abortId);
+                if (cancelled) return;
+                resourceIndex = { context, loadedAt: Date.now(), items };
+                setResources(items);
+                setResourceError(error);
+            } catch (loadError) {
+                if (cancelled) return;
+                setResourceError(loadError instanceof Error ? loadError.message : String(loadError));
+            } finally {
+                if (!cancelled) setLoading(false);
+            }
+        })();
+        return () => {
+            cancelled = true;
+            setLoading(false);
+            void window.kubectl?.abort?.(abortId).catch((): void => undefined);
+        };
+    }, [open]);
 
-        return items;
-    }, [resources, resourceTypes]);
+    const commands = useMemo<CommandItem[]>(() => [
+        ...NAVIGATION_TYPES.map((kind): CommandItem => ({
+            id: `nav-${kind.type}`,
+            title: `Go to ${kind.label}`,
+            subtitle: `Open the ${kind.label} list`,
+            category: 'navigation',
+            action: () => {
+                navigateToResource(kind.type);
+                close();
+            },
+            keywords: [kind.type, kind.label, ...kind.keywords],
+        })),
+        {
+            id: 'nav-settings',
+            title: 'Settings',
+            subtitle: 'Open application settings',
+            category: 'navigation',
+            action: () => {
+                window.location.hash = '#/settings';
+                close();
+            },
+            keywords: ['settings', 'preferences', 'config'],
+        },
+        {
+            id: 'nav-plugins',
+            title: 'Plugin Manager',
+            subtitle: 'Manage installed plugins',
+            category: 'navigation',
+            action: () => {
+                window.location.hash = '#/plugins';
+                close();
+            },
+            keywords: ['plugins', 'extensions'],
+        },
+        {
+            id: 'nav-marketplace',
+            title: 'Marketplace',
+            subtitle: 'Browse and install plugins',
+            category: 'navigation',
+            action: () => {
+                window.location.hash = '#/marketplace';
+                close();
+            },
+            keywords: ['marketplace', 'install', 'store'],
+        },
+    ], [close]);
 
-    // Filter commands based on query
-    const filteredCommands = useMemo(() => {
-        if (!query.trim()) return commands.slice(0, 10);
-        const lowerQuery = query.toLowerCase();
-        return commands
+    const filteredCommands = useMemo<CommandItem[]>(() => {
+        const lowerQuery = query.trim().toLowerCase();
+        if (!lowerQuery) return commands.slice(0, 10);
+        const matchingCommands = commands
             .filter(cmd =>
                 cmd.title.toLowerCase().includes(lowerQuery) ||
                 cmd.subtitle?.toLowerCase().includes(lowerQuery) ||
                 cmd.keywords.some(k => k.toLowerCase().includes(lowerQuery))
             )
-            .slice(0, 15);
-    }, [commands, query]);
+            .slice(0, MAX_COMMAND_RESULTS);
+        const matchingResources = resources
+            .map((resource) => ({ resource, rank: rankResource(resource, lowerQuery) }))
+            .filter(({ rank }) => rank >= 0)
+            .sort((a, b) => a.rank - b.rank || a.resource.name.length - b.resource.name.length || a.resource.name.localeCompare(b.resource.name))
+            .slice(0, MAX_RESOURCE_RESULTS)
+            .map(({ resource }): CommandItem => ({
+                id: `resource-${resource.type}-${resource.namespace}-${resource.name}`,
+                title: resource.name,
+                subtitle: resource.namespace ? `${resource.kind} · ${resource.namespace}` : resource.kind,
+                category: 'resource',
+                action: () => {
+                    navigateToResource(resource.type, resource.name, resource.namespace);
+                    close();
+                },
+                keywords: [],
+            }));
+        return [...matchingCommands, ...matchingResources];
+    }, [commands, resources, query, close]);
 
     // Reset selection when filtered results change
     useEffect(() => {
@@ -130,8 +249,9 @@ const CommandPalette: React.FC = () => {
     // Handle keyboard shortcuts
     useEffect(() => {
         const handleKeyDown = (e: KeyboardEvent) => {
-            // Cmd/Ctrl + K to open
-            if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
+            if (e.isComposing) return;
+            // Cmd/Ctrl + Shift + P to open (Cmd/Ctrl + K belongs to the built-in global search)
+            if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === 'p') {
                 e.preventDefault();
                 setOpen(true);
             }
@@ -179,10 +299,12 @@ const CommandPalette: React.FC = () => {
         }
     };
 
+    const hasQuery = query.trim().length > 0;
+
     return (
         <Dialog
             open={open}
-            onClose={() => setOpen(false)}
+            onClose={close}
             maxWidth="sm"
             fullWidth
             fullScreen={isMobile}
@@ -214,7 +336,7 @@ const CommandPalette: React.FC = () => {
                             ),
                             endAdornment: query && (
                                 <InputAdornment position="end">
-                                    <IconButton size="small" onClick={() => setQuery('')}>
+                                    <IconButton size="small" onClick={() => setQuery('')} aria-label="Clear search">
                                         <ClearIcon fontSize="small" />
                                     </IconButton>
                                 </InputAdornment>
@@ -229,7 +351,7 @@ const CommandPalette: React.FC = () => {
                         <Box sx={{ p: 4, textAlign: 'center' }}>
                             <Typography sx={{
                                 color: 'text.secondary'
-                            }}>No results found</Typography>
+                            }}>{hasQuery && loading ? 'Searching cluster resources…' : 'No results found'}</Typography>
                         </Box>
                     ) : (
                         filteredCommands.map((cmd, index) => (
@@ -270,6 +392,12 @@ const CommandPalette: React.FC = () => {
                     )}
                 </List>
 
+                {resourceError && (
+                    <Typography variant="caption" sx={{ display: 'block', px: 1.5, py: 0.5, color: 'warning.main' }}>
+                        {resourceError}
+                    </Typography>
+                )}
+
                 <Box sx={{
                     p: 1.5,
                     borderTop: 1,
@@ -282,7 +410,7 @@ const CommandPalette: React.FC = () => {
                         color: 'text.secondary'
                     }}>
                         <KeyboardCommandKeyIcon sx={{ fontSize: 12, verticalAlign: 'middle', mr: 0.5 }} />
-                        K to open
+                        ⇧P to open
                     </Typography>
                     <Typography variant="caption" sx={{
                         color: 'text.secondary'
@@ -303,7 +431,7 @@ const CommandPalette: React.FC = () => {
                     <Typography variant="caption" sx={{
                         color: 'text.secondary'
                     }}>
-                        {filteredCommands.length} results
+                        {loading ? 'Indexing resources…' : `${filteredCommands.length} results`}
                     </Typography>
                 </Box>
             </DialogContent>
@@ -311,41 +439,41 @@ const CommandPalette: React.FC = () => {
     );
 };
 
-const CommandPaletteButton: React.FC = () => {
-    const [open, setOpen] = useState(false);
-
-    return (
-        <Box sx={{ display: 'none' }}>
-            <CommandPalette />
-        </Box>
-    );
-};
-
 registerPlugin({
     id: PLUGIN_ID,
     label: 'Command Palette',
-    description: 'Quick search and navigation with Cmd+K / Ctrl+K keyboard shortcut',
+    description: 'Search cluster resources and jump anywhere with Cmd/Ctrl+Shift+P',
     enabledByDefault: false,
     category: 'utility',
 
     lifecycle: {
         onEnable: () => {
-            // Register the palette component
-            const container = document.createElement('div');
-            container.id = 'command-palette-container';
-            document.body.appendChild(container);
+            // The slot keeps the palette inside the app's theme and providers; it renders nothing until opened.
+            registerPluginSlot({
+                pluginId: PLUGIN_ID,
+                slotName: 'toolbar-right',
+                component: CommandPalette,
+                priority: 90,
+            });
+            registerShortcut({
+                id: 'command-palette-open',
+                keys: ['ctrl', 'shift', 'p'],
+                description: 'Open command palette',
+                category: 'general',
+                pluginId: PLUGIN_ID,
+            });
 
             return () => {
                 unregisterPluginShortcuts(PLUGIN_ID);
-                container.remove();
+                unregisterPluginSlot(PLUGIN_ID, 'toolbar-right');
             };
         },
     },
     capabilities: {
-        summary: 'Quick search and navigation across resources, actions, and settings using Cmd+K',
+        summary: 'Search cluster resources and navigate to resource lists, settings and plugins with Cmd/Ctrl+Shift+P',
         tools: [],
     },
     runtimeCapabilities: {
-        slots: [],
+        slots: ['toolbar-right'],
     },
 });
