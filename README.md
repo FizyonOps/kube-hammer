@@ -10,6 +10,7 @@ Exported from Kube Hammer **development snapshot after v0.6.182**. Each release 
 | Plugin ID | Source |
 | --- | --- |
 | `performance-dashboard` | [`src/plugins/PerformanceDashboardPlugin.tsx`](src/plugins/PerformanceDashboardPlugin.tsx) |
+| `enhanced-terminal` | [`src/plugins/EnhancedTerminalPlugin.tsx`](src/plugins/EnhancedTerminalPlugin.tsx) |
 | `resource-visualization` | [`src/plugins/ResourceVisualizationPlugin.tsx`](src/plugins/ResourceVisualizationPlugin.tsx) |
 | `command-palette` | [`src/plugins/CommandPalettePlugin.tsx`](src/plugins/CommandPalettePlugin.tsx) |
 | `workspace-manager` | [`src/plugins/WorkspaceManagerPlugin.tsx`](src/plugins/WorkspaceManagerPlugin.tsx) |
